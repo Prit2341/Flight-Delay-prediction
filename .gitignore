@@ -1,0 +1,70 @@
+# Virtual Environment
+venv/
+.venv/
+env/
+.env/
+ENV/
+
+# Python cache
+__pycache__/
+*.py[cod]
+*$py.class
+*.pyo
+*.pyd
+
+# Jupyter Notebook checkpoints
+.ipynb_checkpoints/
+
+# Dataset files - CSV
+*.csv
+
+# Compressed files
+*.zip
+*.tar
+*.tar.gz
+*.rar
+*.7z
+
+# Large model files
+*.pth
+*.pt
+*.h5
+*.pkl
+*.pickle
+*.joblib
+
+# Dataset directories
+Dataset/
+2012/
+2013/
+2014/
+2015/
+2016/
+2017/
+2018/
+2019/
+2020/
+2021/
+2022/
+2023/
+2024/
+2025/
+Original dataset/
+Weather Data/
+noaa_isd_data/
+noaa_isd_all_stations/
+ncei_ftp_data/
+
+# OS generated files
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# IDE/Editor files
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# Logs
+*.log
