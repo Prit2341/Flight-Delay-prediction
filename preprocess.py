@@ -1,5 +1,6 @@
 import math
 import logging
+import concurrent.futures
 from pathlib import Path
 from typing import Dict, Iterable, List, Optional, Tuple
 import pandas as pd
@@ -339,7 +340,7 @@ def detect_header(csv_path: Path) -> bool:
     return 'YEAR' in first_line.upper() or 'FL_DATE' in first_line.upper()
 
 
-def process_file(csv_path: Path, chunksize: int = 200_000) -> Iterable[Tuple[pd.DataFrame, Dict]]:
+def process_file(csv_path: Path, chunksize: int = 500_000) -> Iterable[Tuple[pd.DataFrame, Dict]]:
     """Process a CSV file in chunks with validation and feature engineering.
 
     Handles both files with headers (2019+) and without headers (2012-2018).
@@ -348,62 +349,43 @@ def process_file(csv_path: Path, chunksize: int = 200_000) -> Iterable[Tuple[pd.
         Tuple of (processed_dataframe, quality_metrics) for each chunk
     """
     try:
-        # Detect if file has header
         has_header = detect_header(csv_path)
-
         logger.info(f"Processing {csv_path.name} (header={'yes' if has_header else 'no'})...")
 
-        # Read sample to determine available columns
         if has_header:
             sample_df = pd.read_csv(csv_path, nrows=5)
             available_cols = [c for c in BASE_COLS if c in sample_df.columns]
+            dtype_map = {k: v for k, v in DTYPES.items() if k in available_cols and k != "FL_DATE"}
+            read_kwargs = {
+                'usecols': available_cols,
+                'dtype': dtype_map,
+                'chunksize': chunksize,
+                'low_memory': False,
+                'on_bad_lines': 'warn'
+            }
         else:
-            # For files without headers, read with column names
-            sample_df = pd.read_csv(csv_path, nrows=5, header=None, names=BASE_COLS)
-            # Check which columns have any non-null data
-            available_cols = [col for col in BASE_COLS if col in sample_df.columns]
+            # Count actual columns in the file first, then assign only that many names
+            with open(csv_path, 'r', encoding='utf-8') as f:
+                actual_col_count = len(f.readline().split(','))
+            col_names = BASE_COLS[:actual_col_count]
+            dtype_map = {k: v for k, v in DTYPES.items() if k in col_names and k != "FL_DATE"}
+            read_kwargs = {
+                'header': None,
+                'names': col_names,
+                'dtype': dtype_map,
+                'chunksize': chunksize,
+                'low_memory': False,
+                'on_bad_lines': 'warn'
+            }
+            available_cols = col_names
 
         logger.info(f"  {len(available_cols)}/{len(BASE_COLS)} columns available")
 
-        # Use safer dtypes to avoid parsing errors
-        dtype_map = {k: v for k, v in DTYPES.items() if k in available_cols and k != "FL_DATE"}
-
-        # Build read_csv arguments
-        read_kwargs = {
-            'dtype': dtype_map,
-            'chunksize': chunksize,
-            'low_memory': False,
-            'on_bad_lines': 'warn'
-        }
-
-        if has_header:
-            read_kwargs['usecols'] = available_cols
-        else:
-            # No header - specify names and use only available columns
-            read_kwargs['header'] = None
-            read_kwargs['names'] = BASE_COLS
-            # Only select columns that exist (based on column count)
-            with open(csv_path, 'r', encoding='utf-8') as f:
-                first_line = f.readline()
-                actual_col_count = len(first_line.split(','))
-            read_kwargs['usecols'] = list(range(min(actual_col_count, len(BASE_COLS))))
-
-        # Process file in chunks
         for i, chunk in enumerate(pd.read_csv(csv_path, **read_kwargs)):
             try:
-                # For headerless files, assign proper column names
-                if not has_header and chunk.shape[1] < len(BASE_COLS):
-                    # Trim BASE_COLS to match actual columns
-                    chunk.columns = BASE_COLS[:chunk.shape[1]]
-
-                # Validate and clean data
                 chunk_clean, quality_metrics = validate_and_clean_data(chunk)
-
-                # Add features
                 chunk_enriched = add_features(chunk_clean)
-
                 yield chunk_enriched, quality_metrics
-
             except Exception as e:
                 logger.error(f"Error processing chunk {i} from {csv_path.name}: {e}")
                 continue
@@ -413,20 +395,52 @@ def process_file(csv_path: Path, chunksize: int = 200_000) -> Iterable[Tuple[pd.
         raise
 
 
+def _worker(args: Tuple[str, str]) -> Tuple[str, Dict, int, Optional[str]]:
+    """Worker function for parallel file processing.
+    Each worker processes one CSV and writes to a temp file.
+    Returns (temp_path, quality_metrics, chunks_written, error_or_None)
+    """
+    csv_path_str, temp_path_str = args
+    csv_path = Path(csv_path_str)
+    temp_path = Path(temp_path_str)
+
+    quality = {
+        'rows_input': 0, 'rows_output': 0, 'rows_dropped': 0,
+        'missing_critical_fields': 0, 'invalid_delays': 0,
+        'invalid_times': 0, 'invalid_distances': 0
+    }
+    chunks_written = 0
+
+    try:
+        for df, qm in process_file(csv_path):
+            header = not temp_path.exists()
+            df.to_csv(temp_path, mode='a', header=header, index=False)
+            for k in quality:
+                quality[k] += qm.get(k, 0)
+            chunks_written += 1
+        return str(temp_path), quality, chunks_written, None
+    except Exception as e:
+        return str(temp_path), quality, chunks_written, str(e)
+
+
+WORKERS = 4  # parallel files at once — tune to your CPU core count
+
+
 def run() -> None:
-    """Main preprocessing pipeline with quality reporting."""
+    """Main preprocessing pipeline — parallel file processing."""
     csv_files = sorted(DATA_DIR.glob("*.csv"))
     if not csv_files:
         raise SystemExit(f"No CSV files found under {DATA_DIR}")
 
-    logger.info(f"Found {len(csv_files)} CSV files to process")
+    logger.info(f"Found {len(csv_files)} CSV files — processing {WORKERS} at a time")
 
-    # Clean up existing output
+    # Clean up existing output and any leftover temp files
     if OUTPUT_FILE.exists():
         OUTPUT_FILE.unlink()
         logger.info(f"Removed existing output file: {OUTPUT_FILE}")
+    for tmp in OUTPUT_DIR.glob("_tmp_*.csv"):
+        tmp.unlink()
 
-    # Track overall quality metrics
     total_quality_metrics = {
         'files_processed': 0,
         'files_failed': 0,
@@ -440,44 +454,54 @@ def run() -> None:
         'chunks_processed': 0
     }
 
-    # Process each file
-    for csv_path in csv_files:
-        try:
-            logger.info(f"Processing {csv_path.name}...")
-            file_chunks = 0
+    # Build worker args: (csv_path, temp_output_path)
+    worker_args = [
+        (str(p), str(OUTPUT_DIR / f"_tmp_{p.stem}.csv"))
+        for p in csv_files
+    ]
 
-            for i, (df, quality_metrics) in enumerate(process_file(csv_path)):
-                # Write to output
-                mode = "a"
-                header = not OUTPUT_FILE.exists()
-                df.to_csv(OUTPUT_FILE, mode=mode, header=header, index=False)
+    temp_files_ordered: List[str] = []
 
-                # Update metrics
-                total_quality_metrics['total_rows_input'] += quality_metrics['rows_input']
-                total_quality_metrics['total_rows_output'] += quality_metrics['rows_output']
-                total_quality_metrics['total_rows_dropped'] += quality_metrics['rows_dropped']
-                total_quality_metrics['total_missing_critical'] += quality_metrics['missing_critical_fields']
-                total_quality_metrics['total_invalid_delays'] += quality_metrics['invalid_delays']
-                total_quality_metrics['total_invalid_times'] += quality_metrics['invalid_times']
-                total_quality_metrics['total_invalid_distances'] += quality_metrics['invalid_distances']
-                total_quality_metrics['chunks_processed'] += 1
+    with concurrent.futures.ProcessPoolExecutor(max_workers=WORKERS) as executor:
+        futures = {executor.submit(_worker, args): args[0] for args in worker_args}
 
-                file_chunks += 1
+        for future in concurrent.futures.as_completed(futures):
+            csv_name = Path(futures[future]).name
+            temp_path, quality, chunks_written, error = future.result()
 
-                if (i + 1) % 10 == 0:
-                    logger.info(f"  Wrote chunk {i + 1} for {csv_path.name}")
+            if error:
+                logger.error(f"Failed: {csv_name} — {error}")
+                total_quality_metrics['files_failed'] += 1
+            else:
+                logger.info(f"Done: {csv_name} ({chunks_written} chunks)")
+                total_quality_metrics['files_processed'] += 1
+                total_quality_metrics['total_rows_input']       += quality['rows_input']
+                total_quality_metrics['total_rows_output']      += quality['rows_output']
+                total_quality_metrics['total_rows_dropped']     += quality['rows_dropped']
+                total_quality_metrics['total_missing_critical'] += quality['missing_critical_fields']
+                total_quality_metrics['total_invalid_delays']   += quality['invalid_delays']
+                total_quality_metrics['total_invalid_times']    += quality['invalid_times']
+                total_quality_metrics['total_invalid_distances']+= quality['invalid_distances']
+                total_quality_metrics['chunks_processed']       += chunks_written
+                if chunks_written > 0:
+                    temp_files_ordered.append(temp_path)
 
-            total_quality_metrics['files_processed'] += 1
-            logger.info(f"Completed {csv_path.name}: {file_chunks} chunks processed")
-
-        except Exception as e:
-            logger.error(f"Failed to process {csv_path.name}: {e}")
-            total_quality_metrics['files_failed'] += 1
+    # Merge all temp files into the final output in sorted order
+    logger.info(f"Merging {len(temp_files_ordered)} temp files into {OUTPUT_FILE}...")
+    for i, tmp_path in enumerate(sorted(temp_files_ordered)):
+        tmp = Path(tmp_path)
+        if not tmp.exists():
             continue
+        header = not OUTPUT_FILE.exists()
+        chunk_iter = pd.read_csv(tmp, chunksize=500_000, low_memory=False)
+        for chunk in chunk_iter:
+            chunk.to_csv(OUTPUT_FILE, mode='a', header=header, index=False)
+            header = False
+        tmp.unlink()
+        if (i + 1) % 20 == 0:
+            logger.info(f"  Merged {i+1}/{len(temp_files_ordered)} files...")
 
-    # Generate quality report
     generate_quality_report(total_quality_metrics)
-
     logger.info(f"Finished! Output written to {OUTPUT_FILE}")
     logger.info(f"Quality report written to {QUALITY_REPORT_FILE}")
 
@@ -522,4 +546,6 @@ def generate_quality_report(metrics: Dict) -> None:
 
 
 if __name__ == "__main__":
+    # Required on Windows for ProcessPoolExecutor — without this guard
+    # each spawned worker re-runs this file and launches more workers infinitely.
     run()

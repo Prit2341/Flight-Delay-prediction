@@ -1,7 +1,15 @@
 {
   "permissions": {
     "allow": [
-      "Bash(python:*)"
+      "Bash(python:*)",
+      "Bash(venv/Scripts/pip list:*)",
+      "Bash(venv/Scripts/python -c \"import torch; print\\(torch.__version__\\)\")",
+      "Bash(venv/Scripts/python -c \"import sklearn; print\\(sklearn.__version__\\)\")",
+      "Bash(venv/Scripts/python -c \"import torch\")",
+      "Bash(venv/Scripts/python -c \"import sklearn\")",
+      "Bash(venv/Scripts/python -c \"import torch; print\\('torch:', torch.__version__\\); print\\('CUDA:', torch.cuda.is_available\\(\\)\\)\")",
+      "Bash(venv/Scripts/python -c ':*)",
+      "Bash(venv/Scripts/python gpu_check.py)"
     ]
   }
 }

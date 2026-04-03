@@ -1,2 +1,5 @@
 # Flight Delay Analysis Report
-Generated on: 2026-01-31 11:55
+
+- Overall delay rate: 13.4%
+- Average delay when delayed: 27.3 min
+- Sample size: 200,000 flights

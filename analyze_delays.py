@@ -18,8 +18,8 @@ OUTPUT_DIR = Path("analysis")
 OUTPUT_DIR.mkdir(exist_ok=True)
 
 # Memory-efficient settings
-CHUNK_SIZE = 50000  # Process 50k rows at a time to manage 16GB RAM
-MAX_SAMPLE_SIZE = 500000  # Maximum sample size for visualization
+CHUNK_SIZE = 1_000_000  # 1M rows per chunk — fewer disk reads, same memory
+MAX_SAMPLE_SIZE = 5_000_000  # 5M sample for visualization
 
 def get_data_info():
     """Get basic info about the dataset without loading it all"""
@@ -28,17 +28,17 @@ def get_data_info():
     if not DATA_FILE.exists():
         raise FileNotFoundError(f"Preprocessed data file not found: {DATA_FILE}")
 
-    # Read just the first chunk to get column info
-    sample_chunk = pd.read_csv(DATA_FILE, chunksize=1000).__next__()
+    sample_chunk = pd.read_csv(DATA_FILE, nrows=5)
     columns = sample_chunk.columns.tolist()
 
-    # Count total rows
-    total_rows = sum(1 for line in open(DATA_FILE, encoding='utf-8')) - 1  # subtract header
+    # Fast row count — file size / average bytes per row (much faster than counting lines)
+    file_size = DATA_FILE.stat().st_size
+    sample_bytes = DATA_FILE.open('rb').read(1_000_000)
+    newlines_in_sample = sample_bytes.count(b'\n')
+    bytes_per_row = len(sample_bytes) / max(newlines_in_sample, 1)
+    total_rows = int(file_size / bytes_per_row)
 
-    print(f"Dataset columns: {columns}")
-    print(f"Total rows: {total_rows:,}")
-    print(f"Estimated memory requirement: {total_rows * len(columns) * 8 / 1024**3:.1f} GB")
-
+    print(f"Columns: {len(columns)}, Estimated rows: ~{total_rows:,}")
     return total_rows, columns
 
 
@@ -139,20 +139,15 @@ def process_chunks(chunk_processor, aggregator=None, sample_size=MAX_SAMPLE_SIZE
         if selected_chunks is not None and i not in selected_chunks:
             continue
             
-        # Process this chunk
         result = chunk_processor(chunk)
         if result is not None:
             results.append(result)
-        
+
         processed_rows += len(chunk)
-        if processed_rows % (CHUNK_SIZE * 10) == 0:
-            print(f"  Processed {processed_rows:,} rows...")
-        
-        # Force garbage collection to free memory
-        del chunk
-        gc.collect()
-        
-        # Stop if we've reached our sample size
+        print(f"  Processed {processed_rows:,} rows...", end='\r')
+
+        del chunk  # free memory — no gc.collect(), Python handles it
+
         if sample_size and processed_rows >= sample_size:
             break
     
@@ -425,36 +420,80 @@ def generate_summary_report(df):
     print(f"Report saved to: {report_path}")
 
 def main():
-    """Run complete delay analysis"""
-    print("🛫 FLIGHT DELAY ANALYSIS STARTING...")
-
-    # Check if preprocessed data exists
+    """Quick analysis — loads 200k rows, generates 4 clean charts."""
     if not DATA_FILE.exists():
-        print(f"\n❌ Error: Preprocessed data file not found: {DATA_FILE}")
-        print("Please run preprocess.py first to generate the preprocessed data.")
+        print(f"Error: {DATA_FILE} not found. Run preprocess.py first.")
         return
 
-    # Run chunk-based analyses (don't require loading all data)
-    delay_overview()
-    delay_reasons_analysis()
+    print("Loading 200k rows...")
+    df = pd.read_csv(DATA_FILE, nrows=200_000, low_memory=False)
+    print(f"Loaded {len(df):,} rows, {len(df.columns)} columns")
 
-    # Load sample for detailed analyses (memory-efficient)
-    print("\nLoading sample data for detailed analyses...")
-    df = load_data(sample_size=100000)  # Adjust or remove for full dataset
+    # ── Overall stats ──────────────────────────────────────────────
+    if 'arr_delayed_15' in df.columns:
+        delay_rate = df['arr_delayed_15'].mean() * 100
+        avg_delay  = df[df['arr_delay_min'] > 0]['arr_delay_min'].mean() if 'arr_delay_min' in df.columns else 0
+        cancelled  = df['is_cancelled'].sum() if 'is_cancelled' in df.columns else 0
+        print(f"\nDelay rate:         {delay_rate:.1f}%")
+        print(f"Avg delay (when delayed): {avg_delay:.1f} min")
+        print(f"Cancelled flights:  {cancelled:,}")
 
-    # Run analyses that need loaded data
-    delay_by_time_patterns(df)
-    airline_delay_comparison(df)
-    airport_delay_analysis(df)
-    seasonal_delay_trends(df)
-    generate_summary_report(df)
+    fig, axes = plt.subplots(2, 2, figsize=(14, 10))
+    fig.suptitle('Flight Delay Analysis', fontsize=16, fontweight='bold')
 
-    print("\n🎯 Analysis complete! Check the 'analysis' folder for visualizations.")
-    print(f"Generated files:")
-    for file in OUTPUT_DIR.glob("*.png"):
-        print(f"  - {file.name}")
-    if (OUTPUT_DIR / "delay_analysis_report.md").exists():
-        print(f"  - delay_analysis_report.md")
+    # 1 — Delay rate by hour
+    if 'dep_hour' in df.columns and 'arr_delayed_15' in df.columns:
+        hourly = df.groupby('dep_hour')['arr_delayed_15'].mean() * 100
+        axes[0, 0].bar(hourly.index, hourly.values, color='steelblue')
+        axes[0, 0].set_title('Delay Rate by Departure Hour')
+        axes[0, 0].set_xlabel('Hour of Day')
+        axes[0, 0].set_ylabel('Delay Rate (%)')
+        axes[0, 0].grid(True, alpha=0.3)
+
+    # 2 — Delay rate by day of week
+    if 'dow' in df.columns and 'arr_delayed_15' in df.columns:
+        days = ['Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat', 'Sun']
+        dow = df.groupby('dow')['arr_delayed_15'].mean() * 100
+        axes[0, 1].bar(days[:len(dow)], dow.values, color='coral')
+        axes[0, 1].set_title('Delay Rate by Day of Week')
+        axes[0, 1].set_ylabel('Delay Rate (%)')
+        axes[0, 1].grid(True, alpha=0.3)
+
+    # 3 — Top 10 airlines by delay rate
+    if 'OP_CARRIER' in df.columns and 'arr_delayed_15' in df.columns:
+        airline = (df.groupby('OP_CARRIER')['arr_delayed_15']
+                     .agg(['mean', 'count'])
+                     .query('count >= 200')
+                     .sort_values('mean', ascending=True)
+                     .tail(10))
+        axes[1, 0].barh(airline.index, airline['mean'] * 100, color='salmon')
+        axes[1, 0].set_title('Top 10 Airlines by Delay Rate')
+        axes[1, 0].set_xlabel('Delay Rate (%)')
+        axes[1, 0].grid(True, alpha=0.3)
+
+    # 4 — Delay reasons breakdown
+    if 'primary_delay_reason' in df.columns:
+        reasons = (df[df['primary_delay_reason'] != 'on_time']['primary_delay_reason']
+                     .value_counts())
+        axes[1, 1].pie(reasons.values, labels=reasons.index, autopct='%1.1f%%',
+                       colors=['#ff6b6b','#4ecdc4','#45b7d1','#96ceb4','#ffeaa7'])
+        axes[1, 1].set_title('Delay Causes Breakdown')
+
+    plt.tight_layout()
+    plt.savefig(OUTPUT_DIR / 'delay_analysis.png', dpi=150, bbox_inches='tight')
+    print(f"\nSaved: analysis/delay_analysis.png")
+    plt.show()
+
+    # ── Summary report ─────────────────────────────────────────────
+    with open(OUTPUT_DIR / 'delay_analysis_report.md', 'w') as f:
+        f.write("# Flight Delay Analysis Report\n\n")
+        if 'arr_delayed_15' in df.columns:
+            f.write(f"- Overall delay rate: {delay_rate:.1f}%\n")
+            f.write(f"- Average delay when delayed: {avg_delay:.1f} min\n")
+            f.write(f"- Sample size: {len(df):,} flights\n")
+
+    print("Saved: analysis/delay_analysis_report.md")
+    print("\nAnalysis complete!")
 
 if __name__ == "__main__":
     main()
